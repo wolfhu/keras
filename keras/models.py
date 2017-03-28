@@ -1,1440 +1,1262 @@
+# -*- coding: utf-8 -*-
 from __future__ import absolute_import
 from __future__ import print_function
-import numpy as np
+
 import warnings
-import pprint
-from six.moves import range
-import six
-import time
-import threading
-try:
-    import queue
-except ImportError:
-    import Queue as queue
+import copy
+import json
+import os
+import yaml
+import numpy as np
 
 from . import backend as K
 from . import optimizers
-from . import objectives
-from . import callbacks as cbks
-from .utils.layer_utils import container_from_config
-from .utils.layer_utils import model_summary
-from .utils.generic_utils import Progbar
-from .layers import containers
+from . import layers as layer_module
+from .utils.io_utils import ask_to_proceed_with_overwrite
+from .engine.training import Model
+from .engine import topology
+from .engine.topology import Layer
+from .engine.topology import Input
+from .legacy import layers as legacy_layers
+from .legacy import models as legacy_models
+from .legacy import interfaces
+
+try:
+    import h5py
+except ImportError:
+    h5py = None
 
 
-def standardize_y(y):
-    if not hasattr(y, 'shape'):
-        y = np.asarray(y)
-    if len(y.shape) == 1:
-        y = np.expand_dims(y, 1)
-    return y
+def save_model(model, filepath, overwrite=True):
+    """Save a model to a HDF5 file.
 
+    The saved model contains:
+        - the model's configuration (topology)
+        - the model's weights
+        - the model's optimizer's state (if any)
 
-def batch_shuffle(index_array, batch_size):
-    batch_count = int(len(index_array) / batch_size)
-    # to reshape we need to be cleanly divisible by batch size
-    # we stash extra items and reappend them after shuffling
-    last_batch = index_array[batch_count * batch_size:]
-    index_array = index_array[:batch_count * batch_size]
-    index_array = index_array.reshape((batch_count, batch_size))
-    np.random.shuffle(index_array)
-    index_array = index_array.flatten()
-    return np.append(index_array, last_batch)
+    Thus the saved model can be reinstantiated in
+    the exact same state, without any of the code
+    used for model definition or training.
 
+    # Arguments
+        model: Keras model instance to be saved.
+        filepath: String, path where to save the model.
+        overwrite: Whether we should overwrite any existing
+            model at the target location, or instead
+            ask the user with a manual prompt.
 
-def make_batches(size, batch_size):
-    nb_batch = int(np.ceil(size / float(batch_size)))
-    return [(i * batch_size, min(size, (i + 1) * batch_size)) for i in range(0, nb_batch)]
+    # Raises
+        ImportError: if h5py is not available.
+    """
 
+    if h5py is None:
+        raise ImportError('`save_model` requires h5py.')
 
-def standardize_X(X):
-    if type(X) == list:
-        return X
+    def get_json_type(obj):
+        """Serialize any object to a JSON-serializable structure.
+
+        # Arguments
+            obj: the object to serialize
+
+        # Returns
+            JSON-serializable structure representing `obj`.
+
+        # Raises
+            TypeError: if `obj` cannot be serialized.
+        """
+        # if obj is a serializable Keras class instance
+        # e.g. optimizer, layer
+        if hasattr(obj, 'get_config'):
+            return {'class_name': obj.__class__.__name__,
+                    'config': obj.get_config()}
+
+        # if obj is any numpy type
+        if type(obj).__module__ == np.__name__:
+            return obj.item()
+
+        # misc functions (e.g. loss function)
+        if callable(obj):
+            return obj.__name__
+
+        # if obj is a python 'type'
+        if type(obj).__name__ == type.__name__:
+            return obj.__name__
+
+        raise TypeError('Not JSON Serializable:', obj)
+
+    from . import __version__ as keras_version
+
+    # If file exists and should not be overwritten.
+    if not overwrite and os.path.isfile(filepath):
+        proceed = ask_to_proceed_with_overwrite(filepath)
+        if not proceed:
+            return
+
+    f = h5py.File(filepath, 'w')
+    f.attrs['keras_version'] = str(keras_version).encode('utf8')
+    f.attrs['backend'] = K.backend().encode('utf8')
+    f.attrs['model_config'] = json.dumps({
+        'class_name': model.__class__.__name__,
+        'config': model.get_config()
+    }, default=get_json_type).encode('utf8')
+
+    model_weights_group = f.create_group('model_weights')
+    if legacy_models.needs_legacy_support(model):
+        model_layers = legacy_models.legacy_sequential_layers(model)
     else:
-        return [X]
+        model_layers = model.layers
+    topology.save_weights_to_hdf5_group(model_weights_group, model_layers)
 
-
-def slice_X(X, start=None, stop=None):
-    '''
-    '''
-    if type(X) == list:
-        if hasattr(start, '__len__'):
-            # hdf5 datasets only support list objects as indices
-            if hasattr(start, 'shape'):
-                start = start.tolist()
-            return [x[start] for x in X]
+    if hasattr(model, 'optimizer'):
+        if isinstance(model.optimizer, optimizers.TFOptimizer):
+            warnings.warn(
+                'TensorFlow optimizers do not '
+                'make it possible to access '
+                'optimizer attributes or optimizer state '
+                'after instantiation. '
+                'As a result, we cannot save the optimizer '
+                'as part of the model save file.'
+                'You will have to compile your model again after loading it. '
+                'Prefer using a Keras optimizer instead '
+                '(see keras.io/optimizers).')
         else:
-            return [x[start:stop] for x in X]
-    else:
-        if hasattr(start, '__len__'):
-            if hasattr(start, 'shape'):
-                start = start.tolist()
-            return X[start]
+            f.attrs['training_config'] = json.dumps({
+                'optimizer_config': {
+                    'class_name': model.optimizer.__class__.__name__,
+                    'config': model.optimizer.get_config()
+                },
+                'loss': model.loss,
+                'metrics': model.metrics,
+                'sample_weight_mode': model.sample_weight_mode,
+                'loss_weights': model.loss_weights,
+            }, default=get_json_type).encode('utf8')
+
+            # Save optimizer weights.
+            symbolic_weights = getattr(model.optimizer, 'weights')
+            if symbolic_weights:
+                optimizer_weights_group = f.create_group('optimizer_weights')
+                weight_values = K.batch_get_value(symbolic_weights)
+                weight_names = []
+                for i, (w, val) in enumerate(zip(symbolic_weights, weight_values)):
+                    # Default values of symbolic_weights is /variable for theano
+                    if K.backend() == 'theano':
+                        if hasattr(w, 'name') and w.name != "/variable":
+                            name = str(w.name)
+                        else:
+                            name = 'param_' + str(i)
+                    else:
+                        if hasattr(w, 'name') and w.name:
+                            name = str(w.name)
+                        else:
+                            name = 'param_' + str(i)
+                    weight_names.append(name.encode('utf8'))
+                optimizer_weights_group.attrs['weight_names'] = weight_names
+                for name, val in zip(weight_names, weight_values):
+                    param_dset = optimizer_weights_group.create_dataset(
+                        name,
+                        val.shape,
+                        dtype=val.dtype)
+                    if not val.shape:
+                        # scalar
+                        param_dset[()] = val
+                    else:
+                        param_dset[:] = val
+    f.flush()
+    f.close()
+
+
+def load_model(filepath, custom_objects=None):
+    """Loads a model saved via `save_model`.
+
+    # Arguments
+        filepath: String, path to the saved model.
+        custom_objects: Optional dictionary mapping names
+            (strings) to custom classes or functions to be
+            considered during deserialization.
+
+    # Returns
+        A Keras model instance. If an optimizer was found
+        as part of the saved model, the model is already
+        compiled. Otherwise, the model is uncompiled and
+        a warning will be displayed.
+
+    # Raises
+        ImportError: if h5py is not available.
+        ValueError: In case of an invalid savefile.
+    """
+    if h5py is None:
+        raise ImportError('`load_model` requires h5py.')
+
+    if not custom_objects:
+        custom_objects = {}
+
+    def convert_custom_objects(obj):
+        """Handles custom object lookup.
+
+        # Arguments
+            obj: object, dict, or list.
+
+        # Returns
+            The same structure, where occurences
+                of a custom object name have been replaced
+                with the custom object.
+        """
+        if isinstance(obj, list):
+            deserialized = []
+            for value in obj:
+                if value in custom_objects:
+                    deserialized.append(custom_objects[value])
+                else:
+                    deserialized.append(value)
+            return deserialized
+        if isinstance(obj, dict):
+            deserialized = {}
+            for key, value in obj.items():
+                if value in custom_objects:
+                    deserialized[key] = custom_objects[value]
+                else:
+                    deserialized[key] = value
+            return deserialized
+        if obj in custom_objects:
+            return custom_objects[obj]
+        return obj
+
+    f = h5py.File(filepath, mode='r')
+
+    # instantiate model
+    model_config = f.attrs.get('model_config')
+    if model_config is None:
+        raise ValueError('No model found in config file.')
+    model_config = json.loads(model_config.decode('utf-8'))
+    model = model_from_config(model_config, custom_objects=custom_objects)
+
+    # set weights
+    topology.load_weights_from_hdf5_group(f['model_weights'], model.layers)
+
+    # instantiate optimizer
+    training_config = f.attrs.get('training_config')
+    if training_config is None:
+        warnings.warn('No training configuration found in save file: '
+                      'the model was *not* compiled. Compile it manually.')
+        f.close()
+        return model
+    training_config = json.loads(training_config.decode('utf-8'))
+    optimizer_config = training_config['optimizer_config']
+    optimizer = optimizers.deserialize(optimizer_config,
+                                       custom_objects=custom_objects)
+
+    # Recover loss functions and metrics.
+    loss = convert_custom_objects(training_config['loss'])
+    metrics = convert_custom_objects(training_config['metrics'])
+    sample_weight_mode = training_config['sample_weight_mode']
+    loss_weights = training_config['loss_weights']
+
+    # Compile model.
+    model.compile(optimizer=optimizer,
+                  loss=loss,
+                  metrics=metrics,
+                  loss_weights=loss_weights,
+                  sample_weight_mode=sample_weight_mode)
+
+    # Set optimizer weights.
+    if 'optimizer_weights' in f:
+        # Build train function (to get weight updates).
+        if isinstance(model, Sequential):
+            model.model._make_train_function()
         else:
-            return X[start:stop]
-
-
-def weighted_objective(fn):
-    def weighted(y_true, y_pred, weights, mask=None):
-        '''
-        '''
-        # score_array has ndim >= 2
-        score_array = fn(y_true, y_pred)
-        if mask is not None:
-            # Cast the mask to floatX to avoid float64 upcasting in theano
-            mask = K.cast(mask, K.floatx())
-            # mask should have the same shape as score_array
-            score_array *= mask
-            #  the loss per batch should be proportional
-            #  to the number of unmasked samples.
-            score_array /= K.mean(mask)
-
-        # reduce score_array to 1D
-        ndim = K.ndim(score_array)
-        for d in range(ndim-1):
-            score_array = K.mean(score_array, axis=-1)
-
-        if weights is not None:
-            score_array *= weights
-        return K.mean(score_array)
-    return weighted
-
-
-def standardize_weights(y, sample_weight=None, class_weight=None):
-    '''
-    '''
-    if sample_weight is not None:
-        assert len(sample_weight) == len(y)
-        return sample_weight.flatten()
-    elif isinstance(class_weight, dict):
-        if len(y.shape) > 2:
-            raise Exception('class_weight not supported for '
-                            '3+ dimensional targets.')
-        if y.shape[1] > 1:
-            y_classes = y.argmax(axis=1)
-        elif y.shape[1] == 1:
-            y_classes = np.reshape(y, y.shape[0])
-        else:
-            y_classes = y
-        weights = np.asarray([class_weight[cls] for cls in y_classes])
-        return weights
-    else:
-        return np.ones((y.shape[0],))
-
-
-def model_from_yaml(yaml_string, custom_objects={}):
-    '''
-        Returns a model generated from a local yaml file,
-        which is either created by hand or from to_yaml method
-        of Sequential or Graph
-    '''
-    import yaml
-    config = yaml.load(yaml_string)
-    return model_from_config(config, custom_objects=custom_objects)
-
-
-def model_from_json(json_string, custom_objects={}):
-    import json
-    config = json.loads(json_string)
-    return model_from_config(config, custom_objects=custom_objects)
-
-
-def model_from_config(config, custom_objects={}):
-    '''
-    '''
-    model_name = config.get('name')
-    if model_name not in {'Graph', 'Sequential'}:
-        raise Exception('Unrecognized model:', model_name)
-
-    # Create a container then set class to appropriate model
-    model = container_from_config(config, custom_objects=custom_objects)
-    if model_name == 'Graph':
-        model.__class__ = Graph
-    elif model_name == 'Sequential':
-        model.__class__ = Sequential
-
-    if 'optimizer' in config:
-        # if it has an optimizer, the model is assumed to be compiled
-        loss = config.get('loss')
-
-        # if a custom loss function is passed replace it in loss
-        if model_name == 'Graph':
-            for l in loss:
-                for c in custom_objects:
-                    if loss[l] == c:
-                        loss[l] = custom_objects[c]
-        elif model_name == 'Sequential' and loss in custom_objects:
-            loss = custom_objects[loss]
-
-        class_mode = config.get('class_mode')
-
-        optimizer_params = dict([(k, v) for k, v in config.get('optimizer').items()])
-        optimizer_name = optimizer_params.pop('name')
-        optimizer = optimizers.get(optimizer_name, optimizer_params)
-
-        if model_name == 'Sequential':
-            model.compile(loss=loss, optimizer=optimizer,
-                          class_mode=class_mode)
-        elif model_name == 'Graph':
-            model.compile(loss=loss, optimizer=optimizer)
+            model._make_train_function()
+        optimizer_weights_group = f['optimizer_weights']
+        optimizer_weight_names = [n.decode('utf8') for n in optimizer_weights_group.attrs['weight_names']]
+        optimizer_weight_values = [optimizer_weights_group[n] for n in optimizer_weight_names]
+        model.optimizer.set_weights(optimizer_weight_values)
+    f.close()
     return model
 
 
-def get_function_name(o):
-    if isinstance(o, six.string_types):
-        return o
-    else:
-        return o.__name__
+def model_from_config(config, custom_objects=None):
+    """Instantiates a Keras model from its config.
+
+    # Arguments
+        config: Configuration dictionary.
+        custom_objects: Optional dictionary mapping names
+            (strings) to custom classes or functions to be
+            considered during deserialization.
+
+    # Returns
+        A Keras model instance (uncompiled).
+    """
+    if isinstance(config, list):
+        raise TypeError('`model_fom_config` expects a dictionary, not a list. '
+                        'Maybe you meant to use '
+                        '`Sequential.from_config(config)`?')
+    return layer_module.deserialize(config, custom_objects=custom_objects)
 
 
-class Model(object):
-    '''Abstract base model class.
-    '''
-    def _fit(self, f, ins, out_labels=[], batch_size=128,
-             nb_epoch=100, verbose=1, callbacks=[],
-             val_f=None, val_ins=None, shuffle=True, metrics=[]):
-        '''
-            Abstract fit function for f(ins).
-            Assume that f returns a list, labelled by out_labels.
-        '''
-        self.training_data = ins
-        self.validation_data = val_ins
-        do_validation = False
-        if val_f and val_ins:
-            do_validation = True
-            if verbose:
-                print('Train on %d samples, validate on %d samples' %
-                      (len(ins[0]), len(val_ins[0])))
+def model_from_yaml(yaml_string, custom_objects=None):
+    """Parses a yaml model configuration file and returns a model instance.
 
-        nb_train_sample = len(ins[0])
-        index_array = np.arange(nb_train_sample)
+    # Arguments
+        yaml_string: YAML string encoding a model configuration.
+        custom_objects: Optional dictionary mapping names
+            (strings) to custom classes or functions to be
+            considered during deserialization.
 
-        history = cbks.History()
-        if verbose:
-            callbacks = [history, cbks.BaseLogger()] + callbacks
+    # Returns
+        A Keras model instance (uncompiled).
+    """
+    config = yaml.load(yaml_string)
+    return layer_module.deserialize(config, custom_objects=custom_objects)
+
+
+def model_from_json(json_string, custom_objects=None):
+    """Parses a JSON model configuration file and returns a model instance.
+
+    # Arguments
+        json_string: JSON string encoding a model configuration.
+        custom_objects: Optional dictionary mapping names
+            (strings) to custom classes or functions to be
+            considered during deserialization.
+
+    # Returns
+        A Keras model instance (uncompiled).
+    """
+    config = json.loads(json_string)
+    return layer_module.deserialize(config, custom_objects=custom_objects)
+
+
+class Sequential(Model):
+    """Linear stack of layers.
+
+    # Arguments
+        layers: list of layers to add to the model.
+
+    # Note
+        The first layer passed to a Sequential model
+        should have a defined input shape. What that
+        means is that it should have received an `input_shape`
+        or `batch_input_shape` argument,
+        or for some type of layers (recurrent, Dense...)
+        an `input_dim` argument.
+
+    # Example
+
+        ```python
+            model = Sequential()
+            # first layer must have a defined input shape
+            model.add(Dense(32, input_dim=500))
+            # afterwards, Keras does automatic shape inference
+            model.add(Dense(32))
+
+            # also possible (equivalent to the above):
+            model = Sequential()
+            model.add(Dense(32, input_shape=(500,)))
+            model.add(Dense(32))
+
+            # also possible (equivalent to the above):
+            model = Sequential()
+            # here the batch dimension is None,
+            # which means any batch size will be accepted by the model.
+            model.add(Dense(32, batch_input_shape=(None, 500)))
+            model.add(Dense(32))
+        ```
+    """
+
+    def __init__(self, layers=None, name=None):
+        self.layers = []  # Stack of layers.
+        self.model = None  # Internal Model instance.
+        self.inputs = []  # List of input tensors
+        self.outputs = []  # List of length 1: the output tensor (unique).
+        self._trainable = True
+        self._initial_weights = None
+
+        # Model attributes.
+        self.inbound_nodes = []
+        self.outbound_nodes = []
+        self.built = False
+
+        # Set model name.
+        if not name:
+            prefix = 'sequential_'
+            name = prefix + str(K.get_uid(prefix))
+        self.name = name
+
+        # Add to the model any layers passed to the constructor.
+        if layers:
+            for layer in layers:
+                self.add(layer)
+
+    def add(self, layer):
+        """Adds a layer instance on top of the layer stack.
+
+        # Arguments
+            layer: layer instance.
+
+        # Raises
+            TypeError: If `layer` is not a layer instance.
+            ValueError: In case the `layer` argument does not
+                know its input shape.
+            ValueError: In case the `layer` argument has
+                multiple output tensors, or is already connected
+                somewhere else (forbidden in `Sequential` models).
+        """
+        if not isinstance(layer, Layer):
+            raise TypeError('The added layer must be '
+                            'an instance of class Layer. '
+                            'Found: ' + str(layer))
+        if not self.outputs:
+            # first layer in model: check that it is an input layer
+            if not layer.inbound_nodes:
+                # create an input layer
+                if not hasattr(layer, 'batch_input_shape'):
+                    raise ValueError('The first layer in a '
+                                     'Sequential model must '
+                                     'get an `input_shape` or '
+                                     '`batch_input_shape` argument.')
+                # Instantiate the input layer.
+                x = Input(batch_shape=layer.batch_input_shape,
+                          dtype=layer.dtype, name=layer.name + '_input')
+                # This will build the current layer
+                # and create the node connecting the current layer
+                # to the input layer we just created.
+                layer(x)
+
+            if len(layer.inbound_nodes) != 1:
+                raise ValueError('A layer added to a Sequential model must '
+                                 'not already be connected somewhere else. '
+                                 'Model received layer ' + layer.name +
+                                 ' which has ' +
+                                 str(len(layer.inbound_nodes)) +
+                                 ' pre-existing inbound connections.')
+
+            if len(layer.inbound_nodes[0].output_tensors) != 1:
+                raise ValueError('All layers in a Sequential model '
+                                 'should have a single output tensor. '
+                                 'For multi-output layers, '
+                                 'use the functional API.')
+
+            self.outputs = [layer.inbound_nodes[0].output_tensors[0]]
+            self.inputs = topology.get_source_inputs(self.outputs[0])
+
+            # We create an input node, which we will keep updated
+            # as we add more layers
+            topology.Node(outbound_layer=self,
+                          inbound_layers=[],
+                          node_indices=[],
+                          tensor_indices=[],
+                          input_tensors=self.inputs,
+                          output_tensors=self.outputs,
+                          # no model-level masking for now
+                          input_masks=[None for _ in self.inputs],
+                          output_masks=[None],
+                          input_shapes=[x._keras_shape for x in self.inputs],
+                          output_shapes=[self.outputs[0]._keras_shape])
         else:
-            callbacks = [history] + callbacks
-        callbacks = cbks.CallbackList(callbacks)
+            output_tensor = layer(self.outputs[0])
+            if isinstance(output_tensor, list):
+                raise TypeError('All layers in a Sequential model '
+                                'should have a single output tensor. '
+                                'For multi-output layers, '
+                                'use the functional API.')
+            self.outputs = [output_tensor]
+            # update self.inbound_nodes
+            self.inbound_nodes[0].output_tensors = self.outputs
+            self.inbound_nodes[0].output_shapes = [self.outputs[0]._keras_shape]
 
-        callbacks._set_model(self)
-        callbacks._set_params({
-            'batch_size': batch_size,
-            'nb_epoch': nb_epoch,
-            'nb_sample': nb_train_sample,
-            'verbose': verbose,
-            'do_validation': do_validation,
-            'metrics': metrics,
-        })
-        callbacks.on_train_begin()
+        self.layers.append(layer)
+        self.built = False
 
-        self.stop_training = False
-        for epoch in range(nb_epoch):
-            callbacks.on_epoch_begin(epoch)
-            if shuffle == 'batch':
-                index_array = batch_shuffle(index_array, batch_size)
-            elif shuffle:
-                np.random.shuffle(index_array)
+    def pop(self):
+        """Removes the last layer in the model.
 
-            batches = make_batches(nb_train_sample, batch_size)
-            for batch_index, (batch_start, batch_end) in enumerate(batches):
-                batch_ids = index_array[batch_start:batch_end]
-                try:
-                    ins_batch = slice_X(ins, batch_ids)
-                except TypeError:
-                    raise Exception('TypeError while preparing batch. '
-                                    'If using HDF5 input data, '
-                                    'pass shuffle="batch".')
-                batch_logs = {}
-                batch_logs['batch'] = batch_index
-                batch_logs['size'] = len(batch_ids)
-                callbacks.on_batch_begin(batch_index, batch_logs)
-                outs = f(ins_batch)
-                if type(outs) != list:
-                    outs = [outs]
-                for l, o in zip(out_labels, outs):
-                    batch_logs[l] = o
+        # Raises
+            TypeError: if there are no layers in the model.
+        """
+        if not self.layers:
+            raise TypeError('There are no layers in the model.')
 
-                callbacks.on_batch_end(batch_index, batch_logs)
+        self.layers.pop()
+        if not self.layers:
+            self.outputs = []
+            self.inbound_nodes = []
+            self.outbound_nodes = []
+        else:
+            self.layers[-1].outbound_nodes = []
+            self.outputs = [self.layers[-1].output]
+            # update self.inbound_nodes
+            self.inbound_nodes[0].output_tensors = self.outputs
+            self.inbound_nodes[0].output_shapes = [self.outputs[0]._keras_shape]
+        self.built = False
 
-                epoch_logs = {}
-                if batch_index == len(batches) - 1:  # last batch
-                    # validation
-                    if do_validation:
-                        # replace with self._evaluate
-                        val_outs = self._test_loop(val_f, val_ins,
-                                                   batch_size=batch_size,
-                                                   verbose=0)
-                        if type(val_outs) != list:
-                            val_outs = [val_outs]
-                        # same labels assumed
-                        for l, o in zip(out_labels, val_outs):
-                            epoch_logs['val_' + l] = o
+    def get_layer(self, name=None, index=None):
+        """Retrieve a layer that is part of the model.
 
-            callbacks.on_epoch_end(epoch, epoch_logs)
-            if self.stop_training:
-                break
+        Returns a layer based on either its name (unique)
+        or its index in the graph. Indices are based on
+        order of horizontal graph traversal (bottom-up).
 
-        callbacks.on_train_end()
-        return history
+        # Arguments
+            name: string, name of layer.
+            index: integer, index of layer.
 
-    def _predict_loop(self, f, ins, batch_size=128, verbose=0):
-        '''Abstract method to loop over some data in batches.
-        '''
-        nb_sample = len(ins[0])
-        outs = []
-        if verbose == 1:
-            progbar = Progbar(target=nb_sample)
-        batches = make_batches(nb_sample, batch_size)
-        index_array = np.arange(nb_sample)
-        for batch_index, (batch_start, batch_end) in enumerate(batches):
-            batch_ids = index_array[batch_start:batch_end]
-            ins_batch = slice_X(ins, batch_ids)
+        # Returns
+            A layer instance.
+        """
+        if self.model is None:
+            self.build()
+        return self.model.get_layer(name, index)
 
-            batch_outs = f(ins_batch)
-            if type(batch_outs) != list:
-                batch_outs = [batch_outs]
-            if batch_index == 0:
-                for batch_out in batch_outs:
-                    shape = (nb_sample,) + batch_out.shape[1:]
-                    outs.append(np.zeros(shape))
+    def call(self, inputs, mask=None):
+        if self.model is None:
+            self.build()
+        return self.model.call(inputs, mask)
 
-            for i, batch_out in enumerate(batch_outs):
-                outs[i][batch_start:batch_end] = batch_out
-            if verbose == 1:
-                progbar.update(batch_end)
-        return outs
+    def build(self, input_shape=None):
+        if not self.inputs or not self.outputs:
+            raise TypeError('Sequential model cannot be built: model is empty.'
+                            ' Add some layers first.')
+        # actually create the model
+        self.model = Model(self.inputs, self.outputs[0],
+                           name=self.name + '_model')
+        self.model.trainable = self.trainable
 
-    def _test_loop(self, f, ins, batch_size=128, verbose=0):
-        '''Abstract method to loop over some data in batches.
-        '''
-        nb_sample = len(ins[0])
-        outs = []
-        if verbose == 1:
-            progbar = Progbar(target=nb_sample)
-        batches = make_batches(nb_sample, batch_size)
-        index_array = np.arange(nb_sample)
-        for batch_index, (batch_start, batch_end) in enumerate(batches):
-            batch_ids = index_array[batch_start:batch_end]
-            ins_batch = slice_X(ins, batch_ids)
+        # mirror model attributes
+        self.supports_masking = self.model.supports_masking
+        self._output_mask_cache = self.model._output_mask_cache
+        self._output_tensor_cache = self.model._output_tensor_cache
+        self._output_shape_cache = self.model._output_shape_cache
+        self.input_layers = self.model.input_layers
+        self.input_layers_node_indices = self.model.input_layers_node_indices
+        self.input_layers_tensor_indices = self.model.input_layers_tensor_indices
+        self.output_layers = self.model.output_layers
+        self.output_layers_node_indices = self.model.output_layers_node_indices
+        self.output_layers_tensor_indices = self.model.output_layers_tensor_indices
+        self.nodes_by_depth = self.model.nodes_by_depth
+        self.container_nodes = self.model.container_nodes
+        self.output_names = self.model.output_names
+        self.input_names = self.model.input_names
+        self._feed_input_names = self.model._feed_input_names
+        self._feed_inputs = self.model._feed_inputs
 
-            batch_outs = f(ins_batch)
-            if type(batch_outs) == list:
-                if batch_index == 0:
-                    for batch_out in enumerate(batch_outs):
-                        outs.append(0.)
-                for i, batch_out in enumerate(batch_outs):
-                    outs[i] += batch_out * len(batch_ids)
+        # Make sure child model callbacks
+        # will call the parent Sequential model.
+        self.model.callback_model = self
+
+        self.built = True
+
+    @property
+    def uses_learning_phase(self):
+        if self.model is None:
+            self.build()
+        return self.model.uses_learning_phase
+
+    @property
+    def _flattened_layers(self):
+        layers = []
+        if self.layers:
+            # Support for legacy models
+            if isinstance(self.layers[0], legacy_layers.Merge):
+                merge = self.layers[0]
+                for layer in merge.layers:
+                    if hasattr(layer, '_flattened_layers'):
+                        for sublayer in layer._flattened_layers:
+                            if sublayer not in layers:
+                                layers.append(sublayer)
+                    elif hasattr(layer, 'layers'):
+                        for sublayer in layer.layers:
+                            if sublayer not in layers:
+                                layers.append(sublayer)
+                    else:
+                        if layer not in layers:
+                            layers.append(layer)
             else:
-                if batch_index == 0:
-                    outs.append(0.)
-                outs[0] += batch_outs * len(batch_ids)
+                if self.layers[0] not in layers:
+                    layers.append(self.layers[0])
+            for layer in self.layers[1:]:
+                if layer not in layers:
+                    layers.append(layer)
+        return layers
 
-            if verbose == 1:
-                progbar.update(batch_end)
-        for i, out in enumerate(outs):
-            outs[i] /= nb_sample
-        return outs
+    def _gather_list_attr(self, attr):
+        all_attrs = []
+        for layer in self._flattened_layers:
+            all_attrs += getattr(layer, attr, [])
+        return all_attrs
 
-    def get_config(self, verbose=0):
-        '''Return the configuration of the model
-        as a dictionary.
+    @property
+    def trainable(self):
+        return self._trainable
 
-        To load a model from its configuration, use
-        `keras.models.model_from_config(config, custom_objects={})`.
-        '''
-        config = super(Model, self).get_config()
-        for p in ['class_mode']:
-            if hasattr(self, p):
-                config[p] = getattr(self, p)
-        if hasattr(self, 'optimizer'):
-            config['optimizer'] = self.optimizer.get_config()
-        if hasattr(self, 'loss'):
-            if type(self.loss) == dict:
-                config['loss'] = dict([(k, get_function_name(v)) for k, v in self.loss.items()])
-            else:
-                config['loss'] = get_function_name(self.loss)
+    @trainable.setter
+    def trainable(self, value):
+        if self.model:
+            self.model.trainable = value
+        self._trainable = value
 
-        if verbose:
-            pp = pprint.PrettyPrinter(indent=4)
-            pp.pprint(config)
-        return config
+    @property
+    def trainable_weights(self):
+        if not self.trainable:
+            return []
+        # Support for legacy behavior
+        return self._gather_list_attr('trainable_weights')
 
-    def to_yaml(self, **kwargs):
-        '''Return a yaml string containing the model configuration.
+    @property
+    def non_trainable_weights(self):
+        # Support for legacy behavior
+        weights = self._gather_list_attr('non_trainable_weights')
+        if not self.trainable:
+            trainable_weights = self._gather_list_attr('trainable_weights')
+            return trainable_weights + weights
+        return weights
 
-        To load a model from a yaml save file, use
-        `keras.models.from_yaml(yaml_string, custom_objects={})`.
+    @property
+    def updates(self):
+        if self.model is None:
+            self.build()
+        return self.model.updates
 
-        `custom_objects` should be a dictionary mapping
-        the names of custom losses / layers / etc to the corresponding
-        functions / classes.
-        '''
-        import yaml
-        config = self.get_config()
-        return yaml.dump(config, **kwargs)
+    @property
+    def state_updates(self):
+        if self.model is None:
+            self.build()
+        return self.model.state_updates
 
-    def to_json(self, **kwargs):
-        '''Return a JSON string containing the model configuration.
+    def get_updates_for(self, inputs):
+        if self.model is None:
+            self.build()
+        return self.model.get_updates_for(inputs)
 
-        To load a model from a JSON save file, use
-        `keras.models.from_json(json_string, custom_objects={})`.
-        '''
-        import json
-        config = self.get_config()
-        return json.dumps(config, **kwargs)
+    @property
+    def losses(self):
+        if self.model is None:
+            self.build()
+        return self.model.losses
 
-    def summary(self):
-        '''Print out a summary of the model architecture,
-        include parameter count information.
-        '''
-        model_summary(self)
+    def get_losses_for(self, inputs):
+        if self.model is None:
+            self.build()
+        return self.model.get_losses_for(inputs)
 
+    @property
+    def regularizers(self):
+        if self.model is None:
+            self.build()
+        return self.model.regularizers
 
-class Sequential(Model, containers.Sequential):
-    '''Linear stack of layers.
+    @property
+    def constraints(self):
+        if self.model is None:
+            self.build()
+        return self.model.constraints
 
-    Inherits from containers.Sequential.
-    '''
+    def get_weights(self):
+        """Retrieves the weights of the model.
+
+        # Returns
+            A flat list of Numpy arrays
+            (one array per model weight).
+        """
+        # Legacy support
+        if legacy_models.needs_legacy_support(self):
+            layers = legacy_models.legacy_sequential_layers(self)
+            weights = []
+            for layer in layers:
+                weights.append(layer.get_weights())
+            return weights
+
+        if self.model is None:
+            self.build()
+        return self.model.get_weights()
+
+    def set_weights(self, weights):
+        """Sets the weights of the model.
+
+        # Arguments
+            weights: Should be a list
+                of Numpy arrays with shapes and types matching
+                the output of `model.get_weights()`.
+        """
+        # Legacy support
+        if legacy_models.needs_legacy_support(self):
+            layers = legacy_models.legacy_sequential_layers(self)
+            for layer in layers:
+                nb_param = len(layer.weights)
+                layer.set_weights(weights[:nb_param])
+                weights = weights[nb_param:]
+
+        if self.model is None:
+            self.build()
+        self.model.set_weights(weights)
+
+    def load_weights(self, filepath, by_name=False):
+        if h5py is None:
+            raise ImportError('`load_weights` requires h5py.')
+        f = h5py.File(filepath, mode='r')
+        if 'layer_names' not in f.attrs and 'model_weights' in f:
+            f = f['model_weights']
+
+        # Legacy support
+        if legacy_models.needs_legacy_support(self):
+            layers = legacy_models.legacy_sequential_layers(self)
+        else:
+            layers = self.layers
+        if by_name:
+            topology.load_weights_from_hdf5_group_by_name(f, layers)
+        else:
+            topology.load_weights_from_hdf5_group(f, layers)
+        if hasattr(f, 'close'):
+            f.close()
+
+    def save_weights(self, filepath, overwrite=True):
+        if h5py is None:
+            raise ImportError('`save_weights` requires h5py.')
+        # If file exists and should not be overwritten:
+        if not overwrite and os.path.isfile(filepath):
+            proceed = ask_to_proceed_with_overwrite(filepath)
+            if not proceed:
+                return
+        # Legacy support
+        if legacy_models.needs_legacy_support(self):
+            layers = legacy_models.legacy_sequential_layers(self)
+        else:
+            layers = self.layers
+
+        f = h5py.File(filepath, 'w')
+        topology.save_weights_to_hdf5_group(f, layers)
+        f.flush()
+        f.close()
+
     def compile(self, optimizer, loss,
-                class_mode="categorical"):
-        '''Configure the learning process.
+                metrics=None,
+                sample_weight_mode=None,
+                **kwargs):
+        """Configures the learning process.
 
         # Arguments
             optimizer: str (name of optimizer) or optimizer object.
-                See [optimizers](optimizers.md).
+                See [optimizers](/optimizers).
             loss: str (name of objective function) or objective function.
-                See [objectives](objectives.md).
-            class_mode: one of "categorical", "binary".
-                This is only used for computing classification accuracy or
-                using the predict_classes method.
-        '''
-        self.optimizer = optimizers.get(optimizer)
+                See [objectives](/objectives).
+            metrics: list of metrics to be evaluated by the model
+                during training and testing.
+                Typically you will use `metrics=['accuracy']`.
+                See [metrics](/metrics).
+            sample_weight_mode: if you need to do timestep-wise
+                sample weighting (2D weights), set this to "temporal".
+                "None" defaults to sample-wise weights (1D).
+            **kwargs: for Theano backend, these are passed into K.function.
+                Ignored for Tensorflow backend.
 
-        self.loss = objectives.get(loss)
-        weighted_loss = weighted_objective(self.loss)
+        # Example
+            ```python
+                model = Sequential()
+                model.add(Dense(32, input_shape=(500,)))
+                model.add(Dense(10, activation='softmax'))
+                model.compile(optimizer='rmsprop',
+                              loss='categorical_crossentropy',
+                              metrics=['accuracy'])
+            ```
+        """
+        # create the underlying model
+        self.build()
+        # call compile method of Model class
+        self.model.compile(optimizer, loss,
+                           metrics=metrics,
+                           sample_weight_mode=sample_weight_mode,
+                           **kwargs)
+        self.optimizer = self.model.optimizer
+        self.loss = self.model.loss
+        self.loss_weights = self.model.loss_weights
+        self.metrics = self.model.metrics
+        self.metrics_tensors = self.model.metrics_tensors
+        self.metrics_names = self.model.metrics_names
+        self.sample_weight_mode = self.model.sample_weight_mode
 
-        # input of model
-        self.X_train = self.get_input(train=True)
-        self.X_test = self.get_input(train=False)
-
-        self.y_train = self.get_output(train=True)
-        self.y_test = self.get_output(train=False)
-
-        # target of model
-        self.y = K.placeholder(ndim=K.ndim(self.y_train))
-        # weights: one scalar per sample
-        self.weights = K.placeholder(ndim=1)
-
-        if hasattr(self.layers[-1], "get_output_mask"):
-            mask = self.layers[-1].get_output_mask()
-        else:
-            mask = None
-        train_loss = weighted_loss(self.y, self.y_train, self.weights, mask)
-        test_loss = weighted_loss(self.y, self.y_test, self.weights, mask)
-
-        if class_mode == "categorical":
-            train_accuracy = K.mean(K.equal(K.argmax(self.y, axis=-1),
-                                            K.argmax(self.y_train, axis=-1)))
-            test_accuracy = K.mean(K.equal(K.argmax(self.y, axis=-1),
-                                           K.argmax(self.y_test, axis=-1)))
-
-        elif class_mode == "binary":
-            train_accuracy = K.mean(K.equal(self.y, K.round(self.y_train)))
-            test_accuracy = K.mean(K.equal(self.y, K.round(self.y_test)))
-        else:
-            raise Exception("Invalid class mode:" + str(class_mode))
-        self.class_mode = class_mode
-
-        for r in self.regularizers:
-            train_loss = r(train_loss)
-        updates = self.optimizer.get_updates(self.params,
-                                             self.constraints,
-                                             train_loss)
-        updates += self.updates
-
-        if type(self.X_train) == list:
-            train_ins = self.X_train + [self.y, self.weights]
-            test_ins = self.X_test + [self.y, self.weights]
-            assert type(self.X_test) == list
-            predict_ins = self.X_test
-        else:
-            train_ins = [self.X_train, self.y, self.weights]
-            test_ins = [self.X_test, self.y, self.weights]
-            predict_ins = [self.X_test]
-
-        self._train = K.function(train_ins, [train_loss], updates=updates)
-        self._train_with_acc = K.function(train_ins, [train_loss, train_accuracy], updates=updates)
-        self._predict = K.function(predict_ins, [self.y_test], updates=self.state_updates)
-        self._test = K.function(test_ins, [test_loss], updates=self.state_updates)
-        self._test_with_acc = K.function(test_ins, [test_loss, test_accuracy], updates=self.state_updates)
-
-    def fit(self, X, y, batch_size=128, nb_epoch=100, verbose=1, callbacks=[],
+    def fit(self, x, y, batch_size=32, epochs=10, verbose=1, callbacks=None,
             validation_split=0., validation_data=None, shuffle=True,
-            show_accuracy=False, class_weight=None, sample_weight=None):
-        '''Train the model for a fixed number of epochs.
-
-        Returns a history object. Its `history` attribute is a record of
-        training loss values at successive epochs,
-        as well as validation loss values (if applicable).
+            class_weight=None, sample_weight=None, initial_epoch=0, **kwargs):
+        """Trains the model for a fixed number of epochs.
 
         # Arguments
-            X: data, as a numpy array.
-            y: labels, as a numpy array.
-            batch_size: int. Number of samples per gradient update.
-            nb_epoch: int.
+            x: input data, as a Numpy array or list of Numpy arrays
+                (if the model has multiple inputs).
+            y: labels, as a Numpy array.
+            batch_size: integer. Number of samples per gradient update.
+            epochs: integer, the number of epochs to train the model.
             verbose: 0 for no logging to stdout,
                 1 for progress bar logging, 2 for one log line per epoch.
-            callbacks: `keras.callbacks.Callback` list.
+            callbacks: list of `keras.callbacks.Callback` instances.
                 List of callbacks to apply during training.
-                See [callbacks](callbacks.md).
+                See [callbacks](/callbacks).
             validation_split: float (0. < x < 1).
                 Fraction of the data to use as held-out validation data.
-            validation_data: tuple (X, y) to be used as held-out
+            validation_data: tuple (x_val, y_val) or tuple
+                (x_val, y_val, val_sample_weights) to be used as held-out
                 validation data. Will override validation_split.
             shuffle: boolean or str (for 'batch').
                 Whether to shuffle the samples at each epoch.
                 'batch' is a special option for dealing with the
                 limitations of HDF5 data; it shuffles in batch-sized chunks.
-            show_accuracy: boolean. Whether to display
-                class accuracy in the logs to stdout at each epoch.
             class_weight: dictionary mapping classes to a weight value,
                 used for scaling the loss function (during training only).
-            sample_weight: list or numpy array with 1:1 mapping to
+            sample_weight: Numpy array of weights for
                 the training samples, used for scaling the loss function
-                (during training only). For time-distributed data,
-                there is one weight per sample *per timestep*,
-                i.e. if your output data is shaped
-                `(nb_samples, timesteps, output_dim)`,
-                your mask should be of shape `(nb_samples, timesteps, 1)`.
-                This allows you to mask out or reweight individual
-                output timesteps, which is useful
-                in sequence to sequence learning.
-        '''
-        if type(X) == list:
-            if len(set([len(a) for a in X] + [len(y)])) != 1:
-                raise Exception('All input arrays and the target array must '
-                                'have the same number of samples.')
-        else:
-            if len(X) != len(y):
-                raise Exception('The input data tensor (X) and '
-                                'the target tensor (y) must have '
-                                'the same number of samples. Found: '
-                                'len(X) = {}, len(y) = {}'.format(len(X), len(y)))
-        if sample_weight is not None:
-            assert len(sample_weight) == len(y), ('"sample_weight" must have '
-                                                  'the same number of samples '
-                                                  'as X and y.')
-        X = standardize_X(X)
-        y = standardize_y(y)
+                (during training only). You can either pass a flat (1D)
+                Numpy array with the same length as the input samples
+                (1:1 mapping between weights and samples),
+                or in the case of temporal data,
+                you can pass a 2D array with shape (samples, sequence_length),
+                to apply a different weight to every timestep of every sample.
+                In this case you should make sure to specify
+                sample_weight_mode="temporal" in compile().
+            initial_epoch: epoch at which to start training
+                (useful for resuming a previous training run)
 
-        val_f = None
-        val_ins = None
-        if validation_data or validation_split:
-            if show_accuracy:
-                val_f = self._test_with_acc
-            else:
-                val_f = self._test
-        if validation_data:
-            if len(validation_data) == 2:
-                X_val, y_val = validation_data
-                if type(X_val) == list:
-                    assert len(set([len(a) for a in X_val] + [len(y_val)])) == 1
-                else:
-                    assert len(X_val) == len(y_val)
-                X_val = standardize_X(X_val)
-                y_val = standardize_y(y_val)
-                sample_weight_val = standardize_weights(y_val)
-            elif len(validation_data) == 3:
-                X_val, y_val, sample_weight_val = validation_data
-                if type(X_val) == list:
-                    assert len(set([len(a) for a in X_val] +
-                                   [len(y_val), len(sample_weight_val)])) == 1
-                else:
-                    assert len(X_val) == len(y_val) == len(sample_weight_val)
-                X_val = standardize_X(X_val)
-                y_val = standardize_y(y_val)
-                sample_weight_val = standardize_weights(y_val,
-                                                        sample_weight=sample_weight_val)
-            else:
-                raise Exception('Invalid format for validation data; '
-                                'provide a tuple (X_val, y_val) or '
-                                '(X_val, y_val, sample_weight). '
-                                'X_val may be a numpy array or a list of '
-                                'numpy arrays depending on your model input.')
-            val_ins = X_val + [y_val, sample_weight_val]
+        # Returns
+            A `History` object. Its `History.history` attribute is
+            a record of training loss values and metrics values
+            at successive epochs, as well as validation loss values
+            and validation metrics values (if applicable).
 
-        elif 0 < validation_split < 1:
-            split_at = int(len(X[0]) * (1 - validation_split))
-            X, X_val = (slice_X(X, 0, split_at), slice_X(X, split_at))
-            y, y_val = (slice_X(y, 0, split_at), slice_X(y, split_at))
-            if sample_weight is not None:
-                sample_weight, sample_weight_val = (slice_X(sample_weight, 0, split_at), slice_X(sample_weight, split_at))
-                sample_weight_val = standardize_weights(y_val,
-                                                        sample_weight=sample_weight_val)
-            else:
-                sample_weight_val = standardize_weights(y_val)
-            val_ins = X_val + [y_val, sample_weight_val]
+        # Raises
+            RuntimeError: if the model was never compiled.
+        """
+        # Legacy support
+        if 'nb_epoch' in kwargs:
+            warnings.warn('The `nb_epoch` argument in `fit` '
+                          'has been renamed `epochs`.')
+            epochs = kwargs.pop('nb_epoch')
+        if kwargs:
+            raise TypeError('Unrecognized keyword arguments: ' + str(kwargs))
 
-        if show_accuracy:
-            f = self._train_with_acc
-            out_labels = ['loss', 'acc']
-        else:
-            f = self._train
-            out_labels = ['loss']
+        if self.model is None:
+            raise RuntimeError('The model needs to be compiled '
+                               'before being used.')
+        return self.model.fit(x, y,
+                              batch_size=batch_size,
+                              epochs=epochs,
+                              verbose=verbose,
+                              callbacks=callbacks,
+                              validation_split=validation_split,
+                              validation_data=validation_data,
+                              shuffle=shuffle,
+                              class_weight=class_weight,
+                              sample_weight=sample_weight,
+                              initial_epoch=initial_epoch)
 
-        sample_weight = standardize_weights(y, class_weight=class_weight,
-                                            sample_weight=sample_weight)
-        ins = X + [y, sample_weight]
-        metrics = ['loss', 'acc', 'val_loss', 'val_acc']
-        return self._fit(f, ins, out_labels=out_labels,
-                         batch_size=batch_size, nb_epoch=nb_epoch,
-                         verbose=verbose, callbacks=callbacks,
-                         val_f=val_f, val_ins=val_ins,
-                         shuffle=shuffle, metrics=metrics)
-
-    def predict(self, X, batch_size=128, verbose=0):
-        '''Generate output predictions for the input samples
-        batch by batch.
+    def evaluate(self, x, y, batch_size=32, verbose=1,
+                 sample_weight=None):
+        """Computes the loss on some input data, batch by batch.
 
         # Arguments
-            X: the input data, as a numpy array.
+            x: input data, as a Numpy array or list of Numpy arrays
+                (if the model has multiple inputs).
+            y: labels, as a Numpy array.
+            batch_size: integer. Number of samples per gradient update.
+            verbose: verbosity mode, 0 or 1.
+            sample_weight: sample weights, as a Numpy array.
+
+        # Returns
+            Scalar test loss (if the model has no metrics)
+            or list of scalars (if the model computes other metrics).
+            The attribute `model.metrics_names` will give you
+            the display labels for the scalar outputs.
+
+        # Raises
+            RuntimeError: if the model was never compiled.
+        """
+        if self.model is None:
+            raise RuntimeError('The model needs to be compiled '
+                               'before being used.')
+        return self.model.evaluate(x, y,
+                                   batch_size=batch_size,
+                                   verbose=verbose,
+                                   sample_weight=sample_weight)
+
+    def predict(self, x, batch_size=32, verbose=0):
+        """Generates output predictions for the input samples.
+
+        The input samples are processed batch by batch.
+
+        # Arguments
+            x: the input data, as a Numpy array.
             batch_size: integer.
             verbose: verbosity mode, 0 or 1.
 
         # Returns
-            A numpy array of predictions.
-        '''
-        X = standardize_X(X)
-        return self._predict_loop(self._predict, X, batch_size, verbose)[0]
+            A Numpy array of predictions.
+        """
+        if self.model is None:
+            self.build()
+        return self.model.predict(x, batch_size=batch_size, verbose=verbose)
 
-    def predict_proba(self, X, batch_size=128, verbose=1):
-        '''Generate class probability predictions for the input samples
-        batch by batch.
+    def predict_on_batch(self, x):
+        """Returns predictions for a single batch of samples.
 
         # Arguments
-            X: the input data, as a numpy array.
+            x: input data, as a Numpy array or list of Numpy arrays
+                (if the model has multiple inputs).
+
+        # Returns
+            A Numpy array of predictions.
+        """
+        if self.model is None:
+            self.build()
+        return self.model.predict_on_batch(x)
+
+    def train_on_batch(self, x, y, class_weight=None,
+                       sample_weight=None):
+        """Single gradient update over one batch of samples.
+
+        # Arguments
+            x: input data, as a Numpy array or list of Numpy arrays
+                (if the model has multiple inputs).
+            y: labels, as a Numpy array.
+            class_weight: dictionary mapping classes to a weight value,
+                used for scaling the loss function (during training only).
+            sample_weight: sample weights, as a Numpy array.
+
+        # Returns
+            Scalar training loss (if the model has no metrics)
+            or list of scalars (if the model computes other metrics).
+            The attribute `model.metrics_names` will give you
+            the display labels for the scalar outputs.
+
+        # Raises
+            RuntimeError: if the model was never compiled.
+        """
+        if self.model is None:
+            raise RuntimeError('The model needs to be compiled '
+                               'before being used.')
+        return self.model.train_on_batch(x, y,
+                                         sample_weight=sample_weight,
+                                         class_weight=class_weight)
+
+    def test_on_batch(self, x, y,
+                      sample_weight=None):
+        """Evaluates the model over a single batch of samples.
+
+        # Arguments
+            x: input data, as a Numpy array or list of Numpy arrays
+                (if the model has multiple inputs).
+            y: labels, as a Numpy array.
+            sample_weight: sample weights, as a Numpy array.
+
+        # Returns
+            Scalar test loss (if the model has no metrics)
+            or list of scalars (if the model computes other metrics).
+            The attribute `model.metrics_names` will give you
+            the display labels for the scalar outputs.
+
+        # Raises
+            RuntimeError: if the model was never compiled.
+        """
+        if self.model is None:
+            raise RuntimeError('The model needs to be compiled '
+                               'before being used.')
+        return self.model.test_on_batch(x, y,
+                                        sample_weight=sample_weight)
+
+    def predict_proba(self, x, batch_size=32, verbose=1):
+        """Generates class probability predictions for the input samples.
+
+        The input samples are processed batch by batch.
+
+        # Arguments
+            x: input data, as a Numpy array or list of Numpy arrays
+                (if the model has multiple inputs).
             batch_size: integer.
             verbose: verbosity mode, 0 or 1.
 
         # Returns
-            A numpy array of probability predictions.
-        '''
-        preds = self.predict(X, batch_size, verbose)
-        if preds.min() < 0 or preds.max() > 1:
-            warnings.warn('Network returning invalid probability values.')
+            A Numpy array of probability predictions.
+        """
+        preds = self.predict(x, batch_size, verbose)
+        if preds.min() < 0. or preds.max() > 1.:
+            warnings.warn('Network returning invalid probability values. '
+                          'The last layer might not normalize predictions '
+                          'into probabilities '
+                          '(like softmax or sigmoid would).')
         return preds
 
-    def predict_classes(self, X, batch_size=128, verbose=1):
-        '''Generate class predictions for the input samples
-        batch by batch.
+    def predict_classes(self, x, batch_size=32, verbose=1):
+        """Generate class predictions for the input samples.
+
+        The input samples are processed batch by batch.
 
         # Arguments
-            X: the input data, as a numpy array.
+            x: input data, as a Numpy array or list of Numpy arrays
+                (if the model has multiple inputs).
             batch_size: integer.
             verbose: verbosity mode, 0 or 1.
 
         # Returns
             A numpy array of class predictions.
-        '''
-        proba = self.predict(X, batch_size=batch_size, verbose=verbose)
-        if self.class_mode == 'categorical':
+        """
+        proba = self.predict(x, batch_size=batch_size, verbose=verbose)
+        if proba.shape[-1] > 1:
             return proba.argmax(axis=-1)
         else:
             return (proba > 0.5).astype('int32')
 
-    def evaluate(self, X, y, batch_size=128, show_accuracy=False,
-                 verbose=1, sample_weight=None):
-        '''Compute the loss on some input data, batch by batch.
+    @interfaces.legacy_generator_methods_support
+    def fit_generator(self, generator,
+                      steps_per_epoch,
+                      epochs=1,
+                      verbose=1,
+                      callbacks=None,
+                      validation_data=None,
+                      validation_steps=None,
+                      class_weight=None,
+                      max_q_size=10,
+                      workers=1,
+                      pickle_safe=False,
+                      initial_epoch=0):
+        """Fits the model on data generated batch-by-batch by a Python generator.
+
+        The generator is run in parallel to the model, for efficiency.
+        For instance, this allows you to do real-time data augmentation
+        on images on CPU in parallel to training your model on GPU.
 
         # Arguments
-            X: input data, as a numpy array.
-            y: labels, as a numpy array.
-            batch_size: integer.
-            show_accuracy: boolean.
+            generator: A generator.
+                The output of the generator must be either
+                - a tuple (inputs, targets)
+                - a tuple (inputs, targets, sample_weights).
+                All arrays should contain the same number of samples.
+                The generator is expected to loop over its data
+                indefinitely. An epoch finishes when `samples_per_epoch`
+                samples have been seen by the model.
+            steps_per_epoch: Total number of steps (batches of samples)
+                to yield from `generator` before declaring one epoch
+                finished and starting the next epoch. It should typically
+                be equal to the number of unique samples of your dataset
+                divided by the batch size.
+            epochs: Integer, total number of iterations on the data.
+            verbose: Verbosity mode, 0, 1, or 2.
+            callbacks: List of callbacks to be called during training.
+            validation_data: This can be either
+                - A generator for the validation data
+                - A tuple (inputs, targets)
+                - A tuple (inputs, targets, sample_weights).
+            validation_steps: Only relevant if `validation_data`
+                is a generator.
+                Number of samples to use from validation generator
+                at the end of every epoch.
+            class_weight: Dictionary mapping class indices to a weight
+                for the class.
+            max_q_size: Maximum size for the generator queue
+            workers: Maximum number of processes to spin up
+            pickle_safe: Ff True, use process based threading.
+                Note that because
+                this implementation relies on multiprocessing,
+                you should not pass
+                non picklable arguments to the generator
+                as they can't be passed
+                easily to children processes.
+            initial_epoch: Epoch at which to start training
+                (useful for resuming a previous training run)
+
+        # Returns
+            A `History` object.
+
+        # Raises
+            RuntimeError: if the model was never compiled.
+
+        # Example
+
+        ```python
+            def generate_arrays_from_file(path):
+                while 1:
+                    f = open(path)
+                    for line in f:
+                        # create Numpy arrays of input data
+                        # and labels, from each line in the file
+                        x, y = process_line(line)
+                        yield (x, y)
+                    f.close()
+
+            model.fit_generator(generate_arrays_from_file('/my_file.txt'),
+                                samples_per_epoch=10000, epochs=10)
+        ```
+        """
+        if self.model is None:
+            raise RuntimeError('The model needs to be compiled '
+                               'before being used.')
+        return self.model.fit_generator(generator,
+                                        steps_per_epoch,
+                                        epochs,
+                                        verbose=verbose,
+                                        callbacks=callbacks,
+                                        validation_data=validation_data,
+                                        validation_steps=validation_steps,
+                                        class_weight=class_weight,
+                                        max_q_size=max_q_size,
+                                        workers=workers,
+                                        pickle_safe=pickle_safe,
+                                        initial_epoch=initial_epoch)
+
+    @interfaces.legacy_generator_methods_support
+    def evaluate_generator(self, generator, steps,
+                           max_q_size=10, workers=1,
+                           pickle_safe=False):
+        """Evaluates the model on a data generator.
+
+        The generator should return the same kind of data
+        as accepted by `test_on_batch`.
+
+        # Arguments
+            generator: Generator yielding tuples (inputs, targets)
+                or (inputs, targets, sample_weights)
+            steps: Total number of steps (batches of samples)
+                to yield from `generator` before stopping.
+            max_q_size: maximum size for the generator queue
+            workers: maximum number of processes to spin up
+            pickle_safe: if True, use process based threading.
+                Note that because this implementation
+                relies on multiprocessing, you should not pass
+                non picklable arguments to the generator
+                as they can't be passed easily to children processes.
+
+        # Returns
+            Scalar test loss (if the model has no metrics)
+            or list of scalars (if the model computes other metrics).
+            The attribute `model.metrics_names` will give you
+            the display labels for the scalar outputs.
+
+        # Raises
+            RuntimeError: if the model was never compiled.
+        """
+        if self.model is None:
+            raise RuntimeError('The model needs to be compiled '
+                               'before being used.')
+        return self.model.evaluate_generator(generator,
+                                             steps,
+                                             max_q_size=max_q_size,
+                                             workers=workers,
+                                             pickle_safe=pickle_safe)
+
+    @interfaces.legacy_generator_methods_support
+    def predict_generator(self, generator, steps,
+                          max_q_size=10, workers=1,
+                          pickle_safe=False, verbose=0):
+        """Generates predictions for the input samples from a data generator.
+
+        The generator should return the same kind of data as accepted by
+        `predict_on_batch`.
+
+        # Arguments
+            generator: generator yielding batches of input samples.
+            steps: Total number of steps (batches of samples)
+                to yield from `generator` before stopping.
+            max_q_size: maximum size for the generator queue
+            workers: maximum number of processes to spin up
+            pickle_safe: if True, use process based threading.
+                Note that because this implementation
+                relies on multiprocessing, you should not pass
+                non picklable arguments to the generator
+                as they can't be passed easily to children processes.
             verbose: verbosity mode, 0 or 1.
-            sample_weight: sample weights, as a numpy array.
-        '''
-        if type(X) == list:
-            if len(set([len(a) for a in X] + [len(y)])) != 1:
-                raise Exception('All input arrays and the target array must '
-                                'have the same number of samples.')
-        else:
-            if len(X) != len(y):
-                raise Exception('The input data tensor (X) and '
-                                'the target tensor (y) must have '
-                                'the same number of samples. Found: '
-                                'len(X) = {}, len(y) = {}'.format(len(X), len(y)))
-        if sample_weight is not None:
-            assert len(sample_weight) == len(y), ('"sample_weight" must have '
-                                                  'the same number of samples '
-                                                  'as X and y.')
-        X = standardize_X(X)
-        y = standardize_y(y)
-        sample_weight = standardize_weights(y, sample_weight=sample_weight)
-
-        ins = X + [y, sample_weight]
-        if show_accuracy:
-            f = self._test_with_acc
-        else:
-            f = self._test
-        outs = self._test_loop(f, ins, batch_size, verbose)
-        if show_accuracy:
-            return outs
-        else:
-            return outs[0]
-
-    def train_on_batch(self, X, y, accuracy=False,
-                       class_weight=None, sample_weight=None):
-        '''Single gradient update over one batch of samples.
-
-        Returns the loss over the data,
-        or a tuple `(loss, accuracy)` if `accuracy=True`.
-
-        Arguments: see `fit` method.
-        '''
-        if type(X) == list:
-            if len(set([len(a) for a in X] + [len(y)])) != 1:
-                raise Exception('All input arrays and the target array must '
-                                'have the same number of samples.')
-        else:
-            if len(X) != len(y):
-                raise Exception('The input data tensor (X) and '
-                                'the target tensor (y) must have '
-                                'the same number of samples. Found: '
-                                'len(X) = {}, len(y) = {}'.format(len(X), len(y)))
-        if sample_weight is not None:
-            assert len(sample_weight) == len(y), ('"sample_weight" must have '
-                                                  'the same number of samples '
-                                                  'as X and y.')
-        X = standardize_X(X)
-        y = standardize_y(y)
-        sample_weight = standardize_weights(y, class_weight=class_weight,
-                                            sample_weight=sample_weight)
-        ins = X + [y, sample_weight]
-        if accuracy:
-            return self._train_with_acc(ins)
-        else:
-            return self._train(ins)
-
-    def test_on_batch(self, X, y, accuracy=False, sample_weight=None):
-        '''Returns the loss over a single batch of samples,
-        or a tuple `(loss, accuracy)` if `accuracy=True`.
-
-        Arguments: see `fit` method.
-        '''
-        if type(X) == list:
-            if len(set([len(a) for a in X] + [len(y)])) != 1:
-                raise Exception('All input arrays and the target array must '
-                                'have the same number of samples.')
-        else:
-            if len(X) != len(y):
-                raise Exception('The input data tensor (X) and '
-                                'the target tensor (y) must have '
-                                'the same number of samples. Found: '
-                                'len(X) = {}, len(y) = {}'.format(len(X), len(y)))
-        if sample_weight is not None:
-            assert len(sample_weight) == len(y), ('"sample_weight" must have '
-                                                  'the same number of samples '
-                                                  'as X and y.')
-        X = standardize_X(X)
-        y = standardize_y(y)
-        sample_weight = standardize_weights(y, sample_weight=sample_weight)
-
-        ins = X + [y, sample_weight]
-        if accuracy:
-            return self._test_with_acc(ins)
-        else:
-            return self._test(ins)
-
-    def predict_on_batch(self, X):
-        '''Returns predictions for a single batch of samples.
-        '''
-        ins = standardize_X(X)
-        return self._predict(ins)
-
-    def save_weights(self, filepath, overwrite=False):
-        '''Dump all layer weights to a HDF5 file.
-        '''
-        import h5py
-        import os.path
-        # if file exists and should not be overwritten
-        if not overwrite and os.path.isfile(filepath):
-            import sys
-            get_input = input
-            if sys.version_info[:2] <= (2, 7):
-                get_input = raw_input
-            overwrite = get_input('[WARNING] %s already exists - overwrite? '
-                                  '[y/n]' % (filepath))
-            while overwrite not in ['y', 'n']:
-                overwrite = get_input('Enter "y" (overwrite) or "n" (cancel).')
-            if overwrite == 'n':
-                return
-            print('[TIP] Next time specify overwrite=True in save_weights!')
-
-        f = h5py.File(filepath, 'w')
-        f.attrs['nb_layers'] = len(self.layers)
-        for k, l in enumerate(self.layers):
-            g = f.create_group('layer_{}'.format(k))
-            weights = l.get_weights()
-            g.attrs['nb_params'] = len(weights)
-            for n, param in enumerate(weights):
-                param_name = 'param_{}'.format(n)
-                param_dset = g.create_dataset(param_name, param.shape,
-                                              dtype=param.dtype)
-                param_dset[:] = param
-        f.flush()
-        f.close()
-
-    def load_weights(self, filepath):
-        '''Load all layer weights from a HDF5 save file.
-        '''
-        import h5py
-        f = h5py.File(filepath)
-        for k in range(f.attrs['nb_layers']):
-            # This method does not make use of Sequential.set_weights()
-            # for backwards compatibility.
-            g = f['layer_{}'.format(k)]
-            weights = [g['param_{}'.format(p)] for p in range(g.attrs['nb_params'])]
-            self.layers[k].set_weights(weights)
-        f.close()
-
-    def fit_generator(self, generator, samples_per_epoch, nb_epoch,
-                      verbose=1, show_accuracy=False, callbacks=[],
-                      validation_data=None, class_weight=None, nb_worker=1):
-        '''Fit a model on data generated batch-by-batch by a Python generator.
-        The generator is run in parallel to the model, for efficiency,
-        and can be run by multiple workers at the same time.
-        For instance, this allows you to do real-time data augmentation
-        on images on CPU in parallel to training your model on GPU.
-
-        # Arguments
-            generator: a Python generator,
-                yielding either (X, y) or (X, y, sample_weight).
-                The generator is expected to loop over its data
-                indefinitely. An epoch finishes when `samples_per_epoch`
-                samples have been seen by the model.
-                The output of the generator must be a tuple of either 2 or 3
-                numpy arrays.
-                If the output tuple has two elements, they are assumed to be
-                (input_data, target_data).
-                If it has three elements, they are assumed to be
-                (input_data, target_data, sample_weight).
-                All arrays should contain the same number of samples.
-            samples_per_epoch: integer, number of samples to process before
-                starting a new epoch.
-            nb_epoch: integer, total number of iterations on the data.
-            verbose: verbosity mode, 0, 1, or 2.
-            show_accuracy: boolean. Whether to display accuracy (only relevant
-                for classification problems).
-            callbacks: list of callbacks to be called during training.
-            validation_data: tuple of 2 or 3 numpy arrays. If 2 elements,
-                they are assumed to be (input_data, target_data);
-                if 3 elements, they are assumed to be
-                (input_data, target_data, sample weights).
-            class_weight: dictionary mapping class indices to a weight
-                for the class.
-            nb_worker: integer, number of workers to use for running
-                the generator (in parallel to model training).
-                If using multiple workers, the processing order of batches
-                generated by the model will be non-deterministic.
-                If using multiple workers, make sure to protect
-                any thread-unsafe operation done by the generator
-                using a Python mutex.
 
         # Returns
+            A Numpy array of predictions.
+        """
+        if self.model is None:
+            self.build()
+        return self.model.predict_generator(generator, steps,
+                                            max_q_size=max_q_size,
+                                            workers=workers,
+                                            pickle_safe=pickle_safe,
+                                            verbose=verbose)
 
-        A `History` object.
+    def get_config(self):
+        if isinstance(self.layers[0], legacy_layers.Merge):
+            return self.legacy_get_config()
 
-        # Examples
+        config = []
+        for layer in self.layers:
+            config.append({'class_name': layer.__class__.__name__,
+                           'config': layer.get_config()})
+        return copy.deepcopy(config)
 
-        ```python
-        def generate_arrays_from_file(path):
-            while 1:
-                f = open(path)
-                for line in f:
-                    # create numpy arrays of input data
-                    # and labels, from each line in the file
-                    x, y = process_line(line)
-                    yield x, y
-                f.close()
+    @classmethod
+    def from_config(cls, config, custom_objects=None):
+        if 'class_name' not in config[0] or config[0]['class_name'] == 'Merge':
+            return cls.legacy_from_config(config)
 
-        model.fit_generator(generate_arrays_from_file('/my_file.txt'),
-                            samples_per_epoch=10000, nb_epoch=10)
-        ```
-        '''
-        max_queue_size = 10  # maximum number of batches in queue
-        wait_time = 0.05  # in seconds
-        epoch = 0
-        do_validation = bool(validation_data)
-        if show_accuracy:
-            out_labels = ['loss', 'acc']
-        else:
-            out_labels = ['loss']
-        metrics = ['loss', 'acc', 'val_loss', 'val_acc']
+        model = cls()
+        for conf in config:
+            layer = layer_module.deserialize(conf, custom_objects=custom_objects)
+            model.add(layer)
+        return model
 
-        # prepare callbacks
-        history = cbks.History()
-        if verbose:
-            callbacks = [history, cbks.BaseLogger()] + callbacks
-        else:
-            callbacks = [history] + callbacks
-        callbacks = cbks.CallbackList(callbacks)
-
-        callbacks._set_model(self)
-        callbacks._set_params({
-            'nb_epoch': nb_epoch,
-            'nb_sample': samples_per_epoch,
-            'verbose': verbose,
-            'do_validation': do_validation,
-            'metrics': metrics,
-        })
-        callbacks.on_train_begin()
-
-        # util function to validate the batches produced
-        # by the generator
-        def input_validation(generator_output):
-            if not hasattr(generator_output, '__len__'):
-                _stop.set()
-                raise Exception('The generator output must be a tuple.')
-            if len(generator_output) == 2:
-                X, y = generator_output
-                if type(X) == list:
-                    assert len(set([len(a) for a in X] + [len(y)])) == 1
-                else:
-                    assert len(X) == len(y)
-                sample_weight = None
-            elif len(generator_output) == 3:
-                X, y, sample_weight = generator_output
-                if type(X) == list:
-                    assert len(set([len(a) for a in X] + [len(y), len(sample_weight)])) == 1
-                else:
-                    assert len(X) == len(y) == len(sample_weight)
-            else:
-                _stop.set()
-                raise Exception('The generator output tuple must have '
-                                '2 or 3 elements.')
-            return X, y, sample_weight
-
-        # start generator thread storing batches into a queue
-        generator_queue = queue.Queue()
-        _stop = threading.Event()
-
-        def generator_task():
-            i = 0
-            while not _stop.is_set():
-                try:
-                    if generator_queue.qsize() < max_queue_size:
-                        generator_output = next(generator)
-                        generator_queue.put(generator_output)
-                        i += 1
-                    else:
-                        time.sleep(wait_time)
-                except:
-                    _stop.set()
-                    return
-
-        generator_threads = [threading.Thread(target=generator_task) for _ in range(nb_worker)]
-        for thread in generator_threads:
-            thread.start()
-
-        self.stop_training = False
-        while epoch < nb_epoch:
-            callbacks.on_epoch_begin(epoch)
-            samples_seen = 0
-            batch_index = 0
-            while samples_seen < samples_per_epoch:
-                while not _stop.is_set():
-                    if not generator_queue.empty():
-                        generator_output = generator_queue.get()
-                        break
-                    else:
-                        time.sleep(wait_time)
-
-                X, y, sample_weight = input_validation(generator_output)
-
-                batch_logs = {}
-                batch_size = len(X[0])
-                batch_logs['batch'] = batch_index
-                batch_logs['size'] = batch_size
-                callbacks.on_batch_begin(batch_index, batch_logs)
-                outs = self.train_on_batch(X, y,
-                                           accuracy=show_accuracy,
-                                           sample_weight=sample_weight,
-                                           class_weight=class_weight)
-                if type(outs) != list:
-                    outs = [outs]
-                for l, o in zip(out_labels, outs):
-                    batch_logs[l] = o
-
-                callbacks.on_batch_end(batch_index, batch_logs)
-
-                # construct epoch logs
-                epoch_logs = {}
-                batch_index += 1
-                samples_seen += batch_size
-                if samples_seen >= samples_per_epoch:  # epoch finished
-                    if do_validation:
-                        if hasattr(validation_data, 'next'):
-                            # assumed to be generator
-                            # TODO: call self.evaluate_generator()
-                            _stop.set()
-                            raise NotImplementedError()
-                        else:
-                            # input validation
-                            X, y, sample_weight = input_validation(validation_data)
-                            val_outs = self.evaluate(X, y,
-                                                     show_accuracy=show_accuracy,
-                                                     sample_weight=sample_weight,
-                                                     verbose=0)
-                        if type(val_outs) != list:
-                            val_outs = [val_outs]
-                        # same labels assumed
-                        for l, o in zip(out_labels, val_outs):
-                            epoch_logs['val_' + l] = o
-
-            callbacks.on_epoch_end(epoch, epoch_logs)
-            epoch += 1
-            if self.stop_training:
-                break
-        _stop.set()
-        callbacks.on_train_end()
-        return history
-
-
-class Graph(Model, containers.Graph):
-    '''Arbitrary connection graph.
-    It can have any number of inputs and outputs,
-    with each output trained with its own loss function.
-    The quantity being optimized by a Graph model is
-    the sum of all loss functions over the different outputs.
-
-    Inherits from `containers.Graph`.
-    '''
-    def compile(self, optimizer, loss):
-        '''Configure the learning process.
-
-        # Arguments
-            optimizer: str (name of optimizer) or optimizer object.
-                See [optimizers](optimizers.md).
-            loss: dictionary mapping the name(s) of the output(s) to
-                a loss function (string name of objective function or
-                objective function. See [objectives](objectives.md)).
-        '''
-        ys = []
-        ys_train = []
-        ys_test = []
-        weights = []
-        train_loss = 0.
-        test_loss = 0.
-        for output_name in self.output_order:
-            loss_fn = loss[output_name]
-            output = self.outputs[output_name]
-            y_train = output.get_output(True)
-            y_test = output.get_output(False)
-            y = K.placeholder(ndim=K.ndim(y_train))
-            ys.append(y)
-            ys_train.append(y_train)
-            ys_test.append(y_test)
-
-            if hasattr(output, "get_output_mask"):
-                mask = output.get_output_mask()
-            else:
-                mask = None
-
-            weight = K.placeholder(ndim=1)
-            weights.append(weight)
-            weighted_loss = weighted_objective(objectives.get(loss_fn))
-            train_loss += weighted_loss(y, y_train, weight, mask)
-            test_loss += weighted_loss(y, y_test, weight, mask)
-
-        ins = [self.inputs[name].input for name in self.input_order]
-        train_ins = ins + ys + weights
-        test_ins = ins + ys + weights
-
-        for r in self.regularizers:
-            train_loss = r(train_loss)
-        self.optimizer = optimizers.get(optimizer)
-        updates = self.optimizer.get_updates(self.params,
-                                             self.constraints,
-                                             train_loss)
-        updates += self.updates
-        self.loss = loss
-
-        self._train = K.function(train_ins, [train_loss], updates=updates)
-        self._test = K.function(test_ins, [test_loss], updates=self.state_updates)
-        self._predict = K.function(inputs=ins, outputs=ys_test,
-                                   updates=self.state_updates)
-
-    def fit(self, data, batch_size=128, nb_epoch=100, verbose=1, callbacks=[],
-            validation_split=0., validation_data=None, shuffle=True,
-            class_weight={}, sample_weight={}):
-        '''Train the model for a fixed number of epochs.
-
-        Returns a history object. Its `history` attribute is a record of
-        training loss values at successive epochs,
-        as well as validation loss values (if applicable).
-
-        # Arguments
-            data: dictionary mapping input names and outputs names to
-                appropriate numpy arrays. All arrays should contain
-                the same number of samples.
-            batch_size: int. Number of samples per gradient update.
-            nb_epoch: int.
-            verbose: 0 for no logging to stdout,
-                1 for progress bar logging, 2 for one log line per epoch.
-            callbacks: `keras.callbacks.Callback` list. List of callbacks
-                to apply during training. See [callbacks](callbacks.md).
-            validation_split: float (0. < x < 1). Fraction of the data to
-                use as held-out validation data.
-            validation_data: dictionary mapping input names and outputs names
-                to appropriate numpy arrays to be used as
-                held-out validation data.
-                All arrays should contain the same number of samples.
-                Will override validation_split.
-            shuffle: boolean. Whether to shuffle the samples at each epoch.
-            class_weight: dictionary mapping output names to
-                class weight dictionaries.
-            sample_weight: dictionary mapping output names to
-                numpy arrays of sample weights.
-        '''
-        X = [data[name] for name in self.input_order]
-        y = [standardize_y(data[name]) for name in self.output_order]
-        if len(set([len(a) for a in X] + [len(a) for a in y])) != 1:
-            raise Exception('All input arrays and target arrays must have '
-                            'the same number of samples.')
-
-        sample_weight_list = [standardize_weights(y[i],
-                                                  sample_weight=sample_weight.get(self.output_order[i])) for i in range(len(self.output_order))]
-        class_weight_list = [class_weight.get(name) for name in self.output_order]
-
-        val_f = None
-        val_ins = None
-        if validation_data or validation_split:
-            val_f = self._test
-        if validation_data:
-            # can't use sample weights with validation data at this point
-            y_val = [standardize_y(validation_data[name]) for name in self.output_order]
-            sample_weight = [standardize_weights(y_val[i]) for i in range(len(y_val))]
-            val_ins = [validation_data[name] for name in self.input_order] + [standardize_y(validation_data[name]) for name in self.output_order] + sample_weight
-
-        elif 0 < validation_split < 1:
-            split_at = int(len(X[0]) * (1 - validation_split))
-            X, X_val = (slice_X(X, 0, split_at), slice_X(X, split_at))
-            y, y_val = (slice_X(y, 0, split_at), slice_X(y, split_at))
-            sample_weight_list, sample_weight_list_val = (slice_X(sample_weight_list, 0, split_at), slice_X(sample_weight_list, split_at))
-            val_ins = X_val + y_val + sample_weight_list_val
-
-        f = self._train
-        out_labels = ['loss']
-        metrics = ['loss', 'val_loss']
-
-        sample_weight_list = [standardize_weights(y[i],
-                                                  sample_weight=sample_weight_list[i],
-                                                  class_weight=class_weight_list[i]) for i in range(len(self.output_order))]
-        ins = X + y + sample_weight_list
-        history = self._fit(f, ins, out_labels=out_labels,
-                            batch_size=batch_size, nb_epoch=nb_epoch,
-                            verbose=verbose, callbacks=callbacks,
-                            val_f=val_f, val_ins=val_ins,
-                            shuffle=shuffle, metrics=metrics)
-        return history
-
-    def evaluate(self, data, batch_size=128, verbose=0, sample_weight={}):
-        '''Compute the loss on some input data, batch by batch.
-
-        Arguments: see `fit` method.
-        '''
-        sample_weight = [standardize_weights(data[name],
-                                             sample_weight=sample_weight.get(name)) for name in self.output_order]
-        ins = [data[name] for name in self.input_order] + [standardize_y(data[name]) for name in self.output_order] + sample_weight
-        if len(set([len(a) for a in ins])) != 1:
-            raise Exception('All input arrays and target arrays must have '
-                            'the same number of samples.')
-        outs = self._test_loop(self._test, ins, batch_size, verbose)
-        return outs[0]
-
-    def predict(self, data, batch_size=128, verbose=0):
-        '''Generate output predictions for the input samples
-        batch by batch.
-
-        Arguments: see `fit` method.
-        '''
-        ins = [data[name] for name in self.input_order]
-        if len(set([len(a) for a in ins])) != 1:
-            raise Exception('All input arrays and target arrays must have '
-                            'the same number of samples.')
-        outs = self._predict_loop(self._predict, ins, batch_size, verbose)
-        return dict(zip(self.output_order, outs))
-
-    def train_on_batch(self, data, class_weight={}, sample_weight={}):
-        '''Single gradient update on a batch of samples.
-
-        Arguments: see `fit` method.
-        '''
-        sample_weight = [standardize_weights(data[name],
-                                             sample_weight=sample_weight.get(name),
-                                             class_weight=class_weight.get(name)) for name in self.output_order]
-        ins = [data[name] for name in self.input_order] + [standardize_y(data[name]) for name in self.output_order] + sample_weight
-        if len(set([len(a) for a in ins])) != 1:
-            raise Exception('All input arrays and target arrays must have '
-                            'the same number of samples.')
-        return self._train(ins)
-
-    def test_on_batch(self, data, sample_weight={}):
-        '''Compute the loss on a single batch of samples.
-
-        Arguments: see `fit` method.
-        '''
-        sample_weight = [standardize_weights(data[name],
-                                             sample_weight=sample_weight.get(name)) for name in self.output_order]
-        ins = [data[name] for name in self.input_order] + [standardize_y(data[name]) for name in self.output_order] + sample_weight
-        if len(set([len(a) for a in ins])) != 1:
-            raise Exception('All input arrays and target arrays must have '
-                            'the same number of samples.')
-        return self._test(ins)
-
-    def predict_on_batch(self, data):
-        '''Generate predictions for a single batch of samples.
-        '''
-        ins = [data[name] for name in self.input_order]
-        if len(set([len(a) for a in ins])) != 1:
-            raise Exception('All input arrays and target arrays must have '
-                            'the same number of samples.')
-        outs = self._predict(ins)
-        return dict(zip(self.output_order, outs))
-
-    def save_weights(self, filepath, overwrite=False):
-        '''Save weights from all layers to a HDF5 files.
-        '''
-        import h5py
-        import os.path
-        # if file exists and should not be overwritten
-        if not overwrite and os.path.isfile(filepath):
-            import sys
-            get_input = input
-            if sys.version_info[:2] <= (2, 7):
-                get_input = raw_input
-            overwrite = get_input('[WARNING] %s already exists - overwrite? '
-                                  '[y/n]' % (filepath))
-            while overwrite not in ['y', 'n']:
-                overwrite = get_input('Enter "y" (overwrite) or "n" (cancel).')
-            if overwrite == 'n':
-                return
-            print('[TIP] Next time specify overwrite=True in save_weights!')
-
-        f = h5py.File(filepath, 'w')
-        g = f.create_group('graph')
-        weights = self.get_weights()
-        g.attrs['nb_params'] = len(weights)
-        for n, param in enumerate(weights):
-            param_name = 'param_{}'.format(n)
-            param_dset = g.create_dataset(param_name, param.shape,
-                                          dtype=param.dtype)
-            param_dset[:] = param
-        f.flush()
-        f.close()
-
-    def load_weights(self, filepath):
-        '''Load weights from a HDF5 file.
-        '''
-        import h5py
-        f = h5py.File(filepath)
-        g = f['graph']
-        weights = [g['param_{}'.format(p)] for p in range(g.attrs['nb_params'])]
-        self.set_weights(weights)
-        f.close()
-
-    def fit_generator(self, generator, samples_per_epoch, nb_epoch,
-                      verbose=1, callbacks=[],
-                      validation_data=None, class_weight={}, nb_worker=1):
-        '''Fit a model on data generated batch-by-batch by a Python generator.
-        The generator is run in parallel to the model, for efficiency,
-        and can be run by multiple workers at the same time.
-        For instance, this allows you to do real-time data augmentation
-        on images on CPU in parallel to training your model on GPU.
-
-        # Arguments
-            generator: a generator.
-                The output of the generator must be either a dictionary
-                mapping inputs and outputs names to numpy arrays, or
-                a tuple of dictionaries (input_data, sample_weight).
-                All arrays should contain the same number of samples.
-                The generator is expected to loop over its data
-                indefinitely. An epoch finishes when `samples_per_epoch`
-                samples have been seen by the model.
-            samples_per_epoch: integer, number of samples to process before
-                going to the next epoch.
-            nb_epoch: integer, total number of iterations on the data.
-            verbose: verbosity mode, 0, 1, or 2.
-            callbacks: list of callbacks to be called during training.
-            validation_data: dictionary mapping input names and outputs names
-                to appropriate numpy arrays to be used as
-                held-out validation data.
-                All arrays should contain the same number of samples.
-            class_weight: dictionary mapping class indices to a weight
-                for the class.
-            nb_worker: integer, number of workers to use for running
-                the generator (in parallel to model training).
-                If using multiple workers, the processing order of batches
-                generated by the model will be non-deterministic.
-                If using multiple workers, make sure to protect
-                any thread-unsafe operation done by the generator
-                using a Python mutex.
+    def legacy_get_config(self):
+        """Retrieves the model configuration as a Python list.
 
         # Returns
-
-        A `History` object.
-
-        # Examples
-
-        ```python
-        def generate_arrays_from_file(path):
-            while 1:
-                f = open(path)
-                for line in f:
-                    # create numpy arrays of input data
-                    # and labels, from each line in the file
-                    x1, x2, y = process_line(line)
-                    yield {'input_1': x1, 'input_2': x2, 'output': y}
-                f.close()
-
-        graph.fit_generator(generate_arrays_from_file('/my_file.txt'),
-                            samples_per_epoch=10000, nb_epoch=10)
-        ```
-        '''
-        max_queue_size = 10  # maximum number of batches in queue
-        wait_time = 0.05  # in seconds
-        epoch = 0
-        do_validation = bool(validation_data)
-        out_labels = ['loss']
-        metrics = ['loss', 'val_loss']
-        if not class_weight:
-            class_weight = {}
-
-        # prepare callbacks
-        history = cbks.History()
-        if verbose:
-            callbacks = [history, cbks.BaseLogger()] + callbacks
+            A list of dicts (each dict is a layer config).
+        """
+        config = []
+        if isinstance(self.layers[0], legacy_layers.Merge):
+            assert hasattr(self.layers[0], 'layers')
+            layers = []
+            for layer in self.layers[0].layers:
+                layer_config = {'class_name': layer.__class__.__name__,
+                                'config': layer.get_config()}
+                layers.append(layer_config)
+            merge_config = self.layers[0].get_config()
+            merge_config['layers'] = layers
+            config.append({'class_name': 'Merge', 'config': merge_config})
         else:
-            callbacks = [history] + callbacks
-        callbacks = cbks.CallbackList(callbacks)
+            config.append({'class_name': self.layers[0].__class__.__name__,
+                           'config': self.layers[0].get_config()})
+        for layer in self.layers[1:]:
+            config.append({'class_name': layer.__class__.__name__,
+                           'config': layer.get_config()})
+        return copy.deepcopy(config)
 
-        callbacks._set_model(self)
-        callbacks._set_params({
-            'nb_epoch': nb_epoch,
-            'nb_sample': samples_per_epoch,
-            'verbose': verbose,
-            'do_validation': do_validation,
-            'metrics': metrics,
-        })
-        callbacks.on_train_begin()
+    @classmethod
+    def legacy_from_config(cls, config, layer_cache=None):
+        if not layer_cache:
+            layer_cache = {}
 
-        # util function to validate the batches produced
-        # by the generator
-        def input_validation(generator_output):
-            if type(generator_output) in [list, tuple]:
-                if len(generator_output) == 2:
-                    data, sample_weight = generator_output
-                else:
-                    _stop.set()
-                    raise Exception('The generator output tuple must have '
-                                    '2 dictionary elements: '
-                                    '(data, sample_weight).')
-            elif type(generator_output) == dict:
-                data = generator_output
-                sample_weight = {}
-            else:
-                _stop.set()
-                raise Exception('The generator output must be '
-                                'a data dictionary or a tuple '
-                                '(data, sample_weight).')
-            assert type(data) == dict
-            assert type(sample_weight) == dict
-            if len(set([len(data[name]) for name in data.keys()] +
-                       [len(sample_weight[name]) for name in sample_weight.keys()])) != 1:
-                raise Exception('All input arrays and target arrays must have '
-                                'the same number of samples.')
-            return data, sample_weight
+        def normalize_legacy_config(conf):
+            if 'class_name' not in conf:
+                class_name = conf['name']
+                name = conf.get('custom_name')
+                conf['name'] = name
+                return {'class_name': class_name,
+                        'config': conf}
+            return conf
 
-        # start generator thread storing batches into a queue
-        generator_queue = queue.Queue()
-        _stop = threading.Event()
+        # the model we will return
+        model = cls()
 
-        def generator_task():
-            i = 0
-            while not _stop.is_set():
-                try:
-                    if generator_queue.qsize() < max_queue_size:
-                        generator_output = next(generator)
-                        generator_queue.put(generator_output)
-                        i += 1
-                    else:
-                        time.sleep(wait_time)
-                except:
-                    _stop.set()
-                    return
+        def get_or_create_layer(layer_data):
+            name = layer_data['config'].get('name')
+            if name in layer_cache:
+                return layer_cache[name]
+            layer = layer_module.deserialize(layer_data)
+            layer_cache[name] = layer
+            return layer
 
-        generator_threads = [threading.Thread(target=generator_task) for _ in range(nb_worker)]
-        for thread in generator_threads:
-            thread.start()
+        first_layer = config[0]
+        first_layer = normalize_legacy_config(first_layer)
+        if first_layer['class_name'] == 'Merge':
+            merge_inputs = []
+            first_layer_config = first_layer['config']
+            for merge_input_config in first_layer_config.pop('layers'):
+                merge_input = layer_module.deserialize(merge_input_config)
+                merge_inputs.append(merge_input)
+            first_layer_config['layers'] = merge_inputs
+            merge = legacy_layers.Merge.from_config(first_layer_config)
+            model.add(merge)
+        else:
+            layer = get_or_create_layer(first_layer)
+            model.add(layer)
 
-        self.stop_training = False
-        while epoch < nb_epoch:
-            callbacks.on_epoch_begin(epoch)
-            samples_seen = 0
-            batch_index = 0
-            while samples_seen < samples_per_epoch:
-                while not _stop.is_set():
-                    if not generator_queue.empty():
-                        generator_output = generator_queue.get()
-                        break
-                    else:
-                        time.sleep(wait_time)
-
-                data, sample_weight = input_validation(generator_output)
-
-                batch_logs = {}
-                batch_size = len(data[list(data.keys())[0]])
-                batch_logs['batch'] = batch_index
-                batch_logs['size'] = batch_size
-                callbacks.on_batch_begin(batch_index, batch_logs)
-                outs = self.train_on_batch(data,
-                                           sample_weight=sample_weight,
-                                           class_weight=class_weight)
-                if type(outs) != list:
-                    outs = [outs]
-                for l, o in zip(out_labels, outs):
-                    batch_logs[l] = o
-
-                callbacks.on_batch_end(batch_index, batch_logs)
-
-                # construct epoch logs
-                epoch_logs = {}
-                batch_index += 1
-                samples_seen += batch_size
-                if samples_seen >= samples_per_epoch:  # epoch finished
-                    if do_validation:
-                        if hasattr(validation_data, 'next'):
-                            # assumed to be generator
-                            # TODO: call self.evaluate_generator()
-                            _stop.set()
-                            raise NotImplementedError()
-                        else:
-                            # input validation
-                            data, sample_weight = input_validation(validation_data)
-                            val_outs = self.evaluate(data,
-                                                     sample_weight=sample_weight,
-                                                     verbose=0)
-                        if type(val_outs) != list:
-                            val_outs = [val_outs]
-                        # same labels assumed
-                        for l, o in zip(out_labels, val_outs):
-                            epoch_logs['val_' + l] = o
-
-            callbacks.on_epoch_end(epoch, epoch_logs)
-            epoch += 1
-            if self.stop_training:
-                break
-        _stop.set()
-        callbacks.on_train_end()
-        return history
+        for conf in config[1:]:
+            conf = normalize_legacy_config(conf)
+            layer = get_or_create_layer(conf)
+            model.add(layer)
+        return model
